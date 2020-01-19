@@ -316,6 +316,15 @@ ComPtr<ID3D12Device2> CreateDevice(ComPtr<IDXGIAdapter4> adapter) {
 }
 
 //-----------------------------------------------------------------------------
+/*
+D3D12_COMMAND_LIST_TYPE is a type of the queue to create. There are three main
+types. Direct, Compute, and Copy. Each one is a superset of the following ones.
+This means that DirectQueue can do everything, Compute cannot draw and Copy
+cannot dispatch. The GPU may have multiple queues of some types and it is
+preferred to create the most specialized queue for given tasks.
+E.g., for drawing, Direct is needed but for copying we can create Copy
+and maybe the GPU will use specialized queue which can only copy, etc.
+*/
 ComPtr<ID3D12CommandQueue> CreateCommandQueue(ComPtr<ID3D12Device2> device, D3D12_COMMAND_LIST_TYPE type) {
     ComPtr<ID3D12CommandQueue> d3d12CommandQueue;
 
@@ -329,4 +338,187 @@ ComPtr<ID3D12CommandQueue> CreateCommandQueue(ComPtr<ID3D12Device2> device, D3D1
 
     return d3d12CommandQueue;
 }
+
+//-----------------------------------------------------------------------------
+/*
+This allows us to support variable refresh rate displays.
+*/
+bool CheckTearingSupport() {
+    BOOL allowTearing = FALSE;
+
+    // Rather than create the DXGI 1.5 factory interface directly, we create the
+    // DXGI 1.4 interface and query for the 1.5 interface. This is to enable the 
+    // graphics debugging tools which will not support the 1.5 factory interface 
+    // until a future update.
+    ComPtr<IDXGIFactory4> factory4;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4)))) {
+        ComPtr<IDXGIFactory5> factory5;
+        if (SUCCEEDED(factory4.As(&factory5))) {
+            if (FAILED(factory5->CheckFeatureSupport(
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                &allowTearing, sizeof(allowTearing)))) {
+                allowTearing = FALSE;
+            }
+        }
+    }
+
+    return allowTearing == TRUE;
+}
+
+//-----------------------------------------------------------------------------
+/*
+The swapchain needs at least 2 buffers (back and front).
+
+IDXGISwapChain::Present swaps back and front buffer. Previously bit-block
+transfer was used for preset. This meant that the DX runtime copyied the front
+buffer to Desktop Window Manager's surface. After it was fully copyied the
+image was presented to screen. From Windows 8 DXGI 1.2 flip presentation model
+is used. This means that the front buffer is directly passed to the DWM for
+presentation. It is more space and time efficient - no copy is needed.
+DX12 does not support the bitblt model, only flip.
+
+The swapchain stores pointers to front and all the back buffers. After present
+the pointers are updated (another buffer is front and front becomes back).
+
+Flip has two possible effects - DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL and DISCARD
+seqential means that the DXGI will persist the contents of the bbuffer for us
+DISCARD means that the contents will be discarded after present. Cannot be
+used with multisampling. DISCARD cannot be used with partial presentation
+additionally.
+
+For max FPS with vsync-off, DISCARD should be used. It means that if the
+previously presented frame is still in queue to be presented, it is discarded
+and the new frame is placed in front of the queue instead.
+
+SEQUENTIAL places the frame at the end of the queue. This may cause lag when
+there are no more buffers to be used as a back buffer (Present will block the
+calling thread until a buffer is made available).
+*/
+ComPtr<IDXGISwapChain4> CreateSwapChain(HWND hWnd,
+    ComPtr<ID3D12CommandQueue> commandQueue,
+    uint32_t width, uint32_t height, uint32_t bufferCount) {
+
+    ComPtr<IDXGISwapChain4> dxgiSwapChain4;
+    ComPtr<IDXGIFactory4> dxgiFactory4;
+    UINT createFactoryFlags = 0;
+    #if defined(_DEBUG)
+        createFactoryFlags = DXGI_CREATE_FACTORY_DEBUG;
+    #endif
+
+    ThrowIfFailed(CreateDXGIFactory2(createFactoryFlags, IID_PPV_ARGS(&dxgiFactory4)));
+
+    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
+    swapChainDesc.Width = width; // If zero, width from window is used, can be then obtained by GetDesc
+    swapChainDesc.Height = height; // If zero, height from window is used, can be then obtained by GetDesc
+    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    swapChainDesc.Stereo = FALSE;
+    swapChainDesc.SampleDesc = { 1, 0 }; // For flip model SC { 1, 0 } must be used.
+    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; // May by also SHADER_INPUT
+    swapChainDesc.BufferCount = bufferCount;
+    swapChainDesc.Scaling = DXGI_SCALING_STRETCH;
+    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    // It is recommended to always allow tearing if tearing support is available.
+    swapChainDesc.Flags = CheckTearingSupport() ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
+    ComPtr<IDXGISwapChain1> swapChain1;
+    ThrowIfFailed(dxgiFactory4->CreateSwapChainForHwnd(
+        commandQueue.Get(),
+        hWnd,
+        &swapChainDesc,
+        nullptr,
+        nullptr,
+        &swapChain1
+    ));
+
+    // Disable the Alt+Enter fullscreen toggle feature. Switching to fullscreen
+    // will be handled manually.
+    ThrowIfFailed(dxgiFactory4->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER));
+
+    ThrowIfFailed(swapChain1.As(&dxgiSwapChain4));
+
+    return dxgiSwapChain4;
+}
+
+//-----------------------------------------------------------------------------
+/*
+DHeap can be seen as an array of resource views. Before we can create any views
+we need a memory for them - DHeap. Some views can be allocated from the same
+heap, for example CBV, SRV, and UAV. But RTV and Sampler views require separate
+DHeaps. 
+*/
+ComPtr<ID3D12DescriptorHeap> CreateDescriptorHeap(ComPtr<ID3D12Device2> device,
+    D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t numDescriptors) {
+
+    ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+    desc.NumDescriptors = numDescriptors;
+    desc.Type = type;
+    /*
+    Flags may contain D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE which makes
+    the descriptors boundable on a command list to be referenced by shaders.
+    Without it, CPU can stage the descriptors which can be then copyied to
+    a shader visible descriptor heap.
+    */
+
+    ThrowIfFailed(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&descriptorHeap)));
+
+    return descriptorHeap;
+}
+
+//-----------------------------------------------------------------------------
+/*
+RTV is a resource which can be bound to a slot in the output merger stage of
+the pipeline.
+*/
+void UpdateRenderTargetViews(ComPtr<ID3D12Device2> device,
+    ComPtr<IDXGISwapChain4> swapChain, ComPtr<ID3D12DescriptorHeap> descriptorHeap) {
+
+    UINT rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(descriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+    for (int i = 0; i < g_NumFrames; ++i) {
+        ComPtr<ID3D12Resource> backBuffer;
+        ThrowIfFailed(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffer)));
+
+        // nullptr as description means that a description from the resource
+        // will be used
+        device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtvHandle);
+
+        g_BackBuffers[i] = backBuffer;
+
+        // Manually offset the pointer by a RTV size
+        rtvHandle.Offset(rtvDescriptorSize);
+    }
+}
+
+//-----------------------------------------------------------------------------
+/*
+Just a memory from which the command lists will be allocated. Memory allocated
+by an allocator is reclaimed by Reset. This must be done only after the
+commands finished executing on the GPU. This is in turn checked by a fence.
+
+To achieve the best FPS at least one allocator per frame in flight should be
+used.
+
+D3D12_COMMAND_LIST_TYPE_BUNDLE as a type means that the command buffer may be
+executed only directily via a command list. Bundle is a small list of commands
+recorder once and reused multiple times - even across frames. Also across
+threads. Bundles are not tied to a pipeline state object. Meaning that the
+PSO can update a descriptor table and the bundle will work with different
+data. To be efficient bundles have some restrictions. For example may not be 
+any commands which change the render target. The command to execute bundles
+in command list is ExecuteBundle.
+*/
+ComPtr<ID3D12CommandAllocator> CreateCommandAllocator(ComPtr<ID3D12Device2> device,
+    D3D12_COMMAND_LIST_TYPE type) {
+
+    ComPtr<ID3D12CommandAllocator> commandAllocator;
+    ThrowIfFailed(device->CreateCommandAllocator(type, IID_PPV_ARGS(&commandAllocator)));
+
+    return commandAllocator;
+}
+
+
 
