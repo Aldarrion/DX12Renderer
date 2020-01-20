@@ -178,6 +178,8 @@ void EnableDebugLayer() {
     #endif
 }
 
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+
 //-----------------------------------------------------------------------------
 void RegisterWindowClass(HINSTANCE hInst, const wchar_t* windowClassName) {
     // Register a window class for creating our render window with.
@@ -410,7 +412,7 @@ ComPtr<IDXGISwapChain4> CreateSwapChain(HWND hWnd,
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
     swapChainDesc.Width = width; // If zero, width from window is used, can be then obtained by GetDesc
     swapChainDesc.Height = height; // If zero, height from window is used, can be then obtained by GetDesc
-    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     swapChainDesc.Stereo = FALSE;
     swapChainDesc.SampleDesc = { 1, 0 }; // For flip model SC { 1, 0 } must be used.
     swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; // May by also SHADER_INPUT
@@ -520,5 +522,431 @@ ComPtr<ID3D12CommandAllocator> CreateCommandAllocator(ComPtr<ID3D12Device2> devi
     return commandAllocator;
 }
 
+//-----------------------------------------------------------------------------
+/*
+Command list can be reset after execute (not after execute finishes as command
+allocator). It also needs to be closed before reset.
+*/
+ComPtr<ID3D12GraphicsCommandList> CreateCommandList(ComPtr<ID3D12Device2> device,
+    ComPtr<ID3D12CommandAllocator> commandAllocator, D3D12_COMMAND_LIST_TYPE type) {
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ThrowIfFailed(device->CreateCommandList(0, type, commandAllocator.Get(), nullptr, IID_PPV_ARGS(&commandList)));
 
+    ThrowIfFailed(commandList->Close());
+
+    return commandList;
+}
+
+//-----------------------------------------------------------------------------
+/*
+Fence is GPU/CPU synchronization object. It can be used for synchronization
+on either CPU or GPU. Internally it stores 64-bit uint, initialized upon
+creation. On CPU the value is updated using ID3D12Fence::Signal, on the GPU it
+is updated using ID3D12CommandQueue::Signal.
+To wait for a fence to reach a specific value on CPU we use
+ID3D12Fence::SetEventOnCompletion followed by WaitForSingleObject. To do the
+same on the GPU we use ID3D12CommandQueue::Wait.
+
+Each thread or GPU queue should have at least one fence and a corresponding
+fence value. The same fence object should not be signaled from more than one
+thread or GPU queue but more than one thread or queue can wait on the same
+fence to be signaled.
+
+An OS event handle is used to allow the CPU thread to wait until the fence
+has been signaled with a particular value.
+*/
+ComPtr<ID3D12Fence> CreateFence(ComPtr<ID3D12Device2> device) {
+    ComPtr<ID3D12Fence> fence;
+
+    ThrowIfFailed(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+
+    return fence;
+}
+
+//-----------------------------------------------------------------------------
+/*
+*/
+HANDLE CreateEventHandle() {
+    HANDLE fenceEvent;
+
+    fenceEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+    assert(fenceEvent && "Failed to create fence event.");
+
+    return fenceEvent;
+}
+
+
+//-----------------------------------------------------------------------------
+/*
+Fence is signalled when the GPU reaches this command in its execution.
+*/
+uint64_t Signal(ComPtr<ID3D12CommandQueue> commandQueue, ComPtr<ID3D12Fence> fence,
+    uint64_t& fenceValue) {
+
+    uint64_t fenceValueForSignal = ++fenceValue;
+    ThrowIfFailed(commandQueue->Signal(fence.Get(), fenceValueForSignal));
+
+    return fenceValueForSignal;
+}
+
+//-----------------------------------------------------------------------------
+/*
+Read only resources such as material textures do NOT need to be waited for.
+But resources such as render targets need to be synchronized to be protected
+from being modified from multiple queues at the same time.
+
+This blocks the calling thread until the fence is at `fenceValue`.
+*/
+void WaitForFenceValue(ComPtr<ID3D12Fence> fence, uint64_t fenceValue, HANDLE fenceEvent,
+    std::chrono::milliseconds duration = std::chrono::milliseconds::max()) {
+
+    if (fence->GetCompletedValue() < fenceValue) {
+        ThrowIfFailed(fence->SetEventOnCompletion(fenceValue, fenceEvent));
+        ::WaitForSingleObject(fenceEvent, static_cast<DWORD>(duration.count()));
+    }
+}
+
+//-----------------------------------------------------------------------------
+/*
+Flushing the GPU may be useful for example before resizing bbufers in the swap
+chain. This waits for all the command lists to finish execution on the GPU.
+*/
+void Flush(ComPtr<ID3D12CommandQueue> commandQueue, ComPtr<ID3D12Fence> fence,
+    uint64_t& fenceValue, HANDLE fenceEvent) {
+
+    uint64_t fenceValueForSignal = Signal(commandQueue, fence, fenceValue);
+    WaitForFenceValue(fence, fenceValueForSignal, fenceEvent);
+}
+
+//-----------------------------------------------------------------------------
+/*
+*/
+void Update() {
+    static uint64_t frameCounter = 0;
+    static double elapsedSeconds = 0.0;
+    static std::chrono::high_resolution_clock clock;
+    static auto t0 = clock.now();
+
+    frameCounter++;
+    auto t1 = clock.now();
+    auto deltaTime = t1 - t0;
+    t0 = t1;
+
+    elapsedSeconds += deltaTime.count() * 1e-9;
+    if (elapsedSeconds > 1.0) {
+        char buffer[500];
+        auto fps = frameCounter / elapsedSeconds;
+        sprintf_s(buffer, 500, "FPS: %f\n", fps);
+        OutputDebugStringA(buffer);
+
+        frameCounter = 0;
+        elapsedSeconds = 0.0;
+    }
+}
+
+//-----------------------------------------------------------------------------
+/*
+The resources need to be in correct state, transition is done by a resouce
+barrier. There are several types of barriers. 
+
+Transition transitions a (sub)resource to a particular state before using it.
+For example, before a texture can be used in a pixel shader it must be
+transitioned to PIXEL_SHADER_RESOURCE state.
+
+Aliasing specifies that a resource is used in a placed or reserved heap when
+that resource is aliased with another resource in the same heap.
+
+UAV: Indicates that all UAV accesses to a particular resource have completed
+before any future UAV access can begin. This is necessary when the UAV is
+transitioned for:
+- Read > Write: Guarantees that all previous read operations on the UAV have
+completed before being written to in another shader.
+- Write > Read: Guarantees that all previous write operations on the UAV have
+completed before being read from in another shader.
+- Write > Write: Avoids race conditions that could be caused by different
+shaders in a different draw or dispatch trying to write to the same resource
+(does not avoid race conditions that could be caused in the same draw or
+dispatch call).
+- A UAV barrier is not needed if the resource is being used as a read-only
+(Read > Read) resource between draw or dispatches.
+
+The before state of the resource must be known, it is not tracked internally
+and must be tracked by the application.
+
+It is recommended to store all barriers in a list and execute them all at the
+same time before an operation that requires the resource to be in a particular
+state is executed.
+*/
+void Render() {
+    auto commandAllocator = g_CommandAllocators[g_CurrentBackBufferIndex];
+    auto backBuffer = g_BackBuffers[g_CurrentBackBufferIndex];
+
+    commandAllocator->Reset();
+    g_CommandList->Reset(commandAllocator.Get(), nullptr);
+    
+    // Clear the render target.
+    {
+        CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            backBuffer.Get(),
+            D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET
+        );
+
+        g_CommandList->ResourceBarrier(1, &barrier);
+        FLOAT clearColor[] = { 0.4f, 0.6f, 0.9f, 1.0f };
+        
+        // (const D3D12_CPU_DESCRIPTOR_HANDLE &other, 
+        // INT offsetInDescriptors, 
+        // UINT descriptorIncrementSize)
+        CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
+            g_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+            g_CurrentBackBufferIndex, 
+            g_RTVDescriptorSize
+        );
+
+        g_CommandList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
+    }
+
+    // Present
+    {
+        CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            backBuffer.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        g_CommandList->ResourceBarrier(1, &barrier);
+        
+        // Close must be called before execute and reset
+        ThrowIfFailed(g_CommandList->Close());
+
+        ID3D12CommandList* const commandLists[] = {
+            g_CommandList.Get()
+        };
+
+        // Errors in recording are reported here
+        g_CommandQueue->ExecuteCommandLists(_countof(commandLists), commandLists);
+        
+        UINT syncInterval = g_VSync ? 1 : 0;
+        // DXGI_PRESENT_ALLOW_TEARING does not work with exclusive fullscreen
+        UINT presentFlags = g_TearingSupported && !g_VSync ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        ThrowIfFailed(g_SwapChain->Present(syncInterval, presentFlags));
+
+        g_FrameFenceValues[g_CurrentBackBufferIndex] = Signal(g_CommandQueue, g_Fence, g_FenceValue);
+        
+        // Move the bbufer index forward, with flip, the indices do not have to be sequential
+        // GetCurrentBackBufferIndex takes care of that.
+        g_CurrentBackBufferIndex = g_SwapChain->GetCurrentBackBufferIndex();
+
+        // Wait until GPU finishes the draw of the new current bbufer
+        WaitForFenceValue(g_Fence, g_FrameFenceValues[g_CurrentBackBufferIndex], g_FenceEvent);
+    }
+}
+
+//-----------------------------------------------------------------------------
+/*
+*/
+void Resize(uint32_t width, uint32_t height) {
+    if (g_ClientWidth != width || g_ClientHeight != height) {
+        // Don't allow 0 size swap chain back buffers.
+        g_ClientWidth = std::max(1u, width);
+        g_ClientHeight = std::max(1u, height);
+
+        // Flush the GPU queue to make sure the swap chain's back buffers
+        // are not being referenced by an in-flight command list.
+        Flush(g_CommandQueue, g_Fence, g_FenceValue, g_FenceEvent);
+
+        for (int i = 0; i < g_NumFrames; ++i) {
+            // Any references to the back buffers must be released
+            // before the swap chain can be resized.
+            g_BackBuffers[i].Reset();
+            g_FrameFenceValues[i] = g_FrameFenceValues[g_CurrentBackBufferIndex];
+        }
+        
+        DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
+        ThrowIfFailed(g_SwapChain->GetDesc(&swapChainDesc));
+        ThrowIfFailed(g_SwapChain->ResizeBuffers(g_NumFrames, g_ClientWidth, g_ClientHeight,
+            swapChainDesc.BufferDesc.Format, swapChainDesc.Flags));
+
+        g_CurrentBackBufferIndex = g_SwapChain->GetCurrentBackBufferIndex();
+
+        UpdateRenderTargetViews(g_Device, g_SwapChain, g_RTVDescriptorHeap);
+    }
+}
+
+//-----------------------------------------------------------------------------
+/*
+*/
+void SetFullscreen(bool fullscreen) {
+    if (g_Fullscreen != fullscreen) {
+        g_Fullscreen = fullscreen;
+
+        if (g_Fullscreen) // Switching to fullscreen.
+        {
+            // Store the current window dimensions so they can be restored 
+            // when switching out of fullscreen state.
+            ::GetWindowRect(g_hWnd, &g_WindowRect);
+            // Set the window style to a borderless window so the client area fills
+            // the entire screen.
+            UINT windowStyle = WS_OVERLAPPEDWINDOW & ~(WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+
+            ::SetWindowLongW(g_hWnd, GWL_STYLE, windowStyle);
+            // Query the name of the nearest display device for the window.
+            // This is required to set the fullscreen dimensions of the window
+            // when using a multi-monitor setup.
+            HMONITOR hMonitor = ::MonitorFromWindow(g_hWnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFOEX monitorInfo = {};
+            monitorInfo.cbSize = sizeof(MONITORINFOEX);
+            ::GetMonitorInfo(hMonitor, &monitorInfo);
+            
+            ::SetWindowPos(g_hWnd, HWND_TOP,
+                monitorInfo.rcMonitor.left,
+                monitorInfo.rcMonitor.top,
+                monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
+                monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE);
+
+            ::ShowWindow(g_hWnd, SW_MAXIMIZE);
+        } else {
+            // Restore all the window decorators.
+            ::SetWindowLong(g_hWnd, GWL_STYLE, WS_OVERLAPPEDWINDOW);
+
+            ::SetWindowPos(g_hWnd, HWND_NOTOPMOST,
+                g_WindowRect.left,
+                g_WindowRect.top,
+                g_WindowRect.right - g_WindowRect.left,
+                g_WindowRect.bottom - g_WindowRect.top,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE);
+
+            ::ShowWindow(g_hWnd, SW_NORMAL);
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+/*
+*/
+LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (g_IsInitialized) {
+        switch (message) {
+            case WM_PAINT:
+                Update();
+                Render();
+                break;
+            case WM_SYSKEYDOWN:
+            case WM_KEYDOWN:
+            {
+                bool alt = (::GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+                switch (wParam) {
+                    case 'V':
+                        g_VSync = !g_VSync;
+                        break;
+                    case VK_ESCAPE:
+                        ::PostQuitMessage(0);
+                        break;
+                    case VK_RETURN:
+                        if (alt) {
+                    case VK_F11:
+                        SetFullscreen(!g_Fullscreen);
+                        }
+                        break;
+                }
+            }
+            break;
+            // The default window procedure will play a system notification sound 
+            // when pressing the Alt+Enter keyboard combination if this message is 
+            // not handled.
+            case WM_SYSCHAR:
+                break;
+            case WM_SIZE:
+            {
+                RECT clientRect = {};
+                ::GetClientRect(g_hWnd, &clientRect);
+
+                int width = clientRect.right - clientRect.left;
+                int height = clientRect.bottom - clientRect.top;
+
+                Resize(width, height);
+            }
+            break;
+            case WM_DESTROY:
+                ::PostQuitMessage(0);
+                break;
+            default:
+                return ::DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+    } else {
+        return ::DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    return 0;
+}
+
+//-----------------------------------------------------------------------------
+/*
+*/
+int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLine, int nCmdShow) {
+    // Windows 10 Creators update adds Per Monitor V2 DPI awareness context.
+    // Using this awareness context allows the client area of the window 
+    // to achieve 100% scaling while still allowing non-client window content to 
+    // be rendered in a DPI sensitive fashion.
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Window class name. Used for registering / creating the window.
+    const wchar_t* windowClassName = L"DX12WindowClass";
+    ParseCommandLineArguments();
+
+    EnableDebugLayer();
+
+    g_TearingSupported = CheckTearingSupport();
+
+    RegisterWindowClass(hInstance, windowClassName);
+    g_hWnd = CreateWindow(windowClassName, hInstance, L"Learning DirectX 12",
+        g_ClientWidth, g_ClientHeight);
+
+    // Initialize the global window rect variable.
+    ::GetWindowRect(g_hWnd, &g_WindowRect);
+
+    ComPtr<IDXGIAdapter4> dxgiAdapter4 = GetAdapter(g_UseWarp);
+
+    g_Device = CreateDevice(dxgiAdapter4);
+
+    g_CommandQueue = CreateCommandQueue(g_Device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+    g_SwapChain = CreateSwapChain(g_hWnd, g_CommandQueue,
+        g_ClientWidth, g_ClientHeight, g_NumFrames);
+
+    g_CurrentBackBufferIndex = g_SwapChain->GetCurrentBackBufferIndex();
+
+    g_RTVDescriptorHeap = CreateDescriptorHeap(g_Device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, g_NumFrames);
+    g_RTVDescriptorSize = g_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    UpdateRenderTargetViews(g_Device, g_SwapChain, g_RTVDescriptorHeap);
+
+    for (int i = 0; i < g_NumFrames; ++i) {
+        g_CommandAllocators[i] = CreateCommandAllocator(g_Device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    }
+    g_CommandList = CreateCommandList(g_Device,
+        g_CommandAllocators[g_CurrentBackBufferIndex], D3D12_COMMAND_LIST_TYPE_DIRECT
+    );
+
+    g_Fence = CreateFence(g_Device);
+    g_FenceEvent = CreateEventHandle();
+
+    g_IsInitialized = true;
+
+    ::ShowWindow(g_hWnd, SW_SHOW);
+
+    MSG msg = {};
+    while (msg.message != WM_QUIT) {
+        if (::PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            ::TranslateMessage(&msg);
+            ::DispatchMessage(&msg);
+        }
+    }
+    
+    // Make sure the command queue has finished all commands before closing.
+    Flush(g_CommandQueue, g_Fence, g_FenceValue, g_FenceEvent);
+
+    ::CloseHandle(g_FenceEvent);
+
+    return 0;
+}
 
