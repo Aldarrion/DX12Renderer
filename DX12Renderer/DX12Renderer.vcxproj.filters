@@ -2,10 +2,19 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="source\main.cpp" />
+    <ClCompile Include="source\application.cpp" />
+    <ClCompile Include="source\window.cpp" />
+    <ClCompile Include="source\commandqueue.cpp" />
+    <ClCompile Include="source\highresolutionclock.cpp" />
+    <ClCompile Include="source\gamebase.cpp" />
+    <ClCompile Include="source\game.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Filter Include="external">
       <UniqueIdentifier>{faa82660-4f28-415c-b5d4-bca45373ee99}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="shaders">
+      <UniqueIdentifier>{1edbb66c-25a2-4179-aaa4-ef76b89e0cee}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -13,5 +22,21 @@
       <Filter>external</Filter>
     </ClInclude>
     <ClInclude Include="include\helpers.h" />
+    <ClInclude Include="include\application.h" />
+    <ClInclude Include="include\window.h" />
+    <ClInclude Include="include\events.h" />
+    <ClInclude Include="include\keycodes.h" />
+    <ClInclude Include="include\commandqueue.h" />
+    <ClInclude Include="include\highresolutionclock.h" />
+    <ClInclude Include="include\gamebase.h" />
+    <ClInclude Include="include\game.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="shaders\ps_simple.hlsl">
+      <Filter>shaders</Filter>
+    </FxCompile>
+    <FxCompile Include="shaders\vs_simple.hlsl">
+      <Filter>shaders</Filter>
+    </FxCompile>
   </ItemGroup>
 </Project>
